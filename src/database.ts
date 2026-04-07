@@ -65,7 +65,7 @@ export async function deleteReminder(id: number, chatId: number) {
       `DELETE FROM reminders WHERE id = $1 AND chat_id = $2`,
       [id, chatId]
     );
-    return result.rowCount > 0;
+    return (result.rowCount ?? 0) > 0;
   } finally {
     client.release();
   }

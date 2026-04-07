@@ -8,7 +8,7 @@ import { startScheduler, checkReminders } from './scheduler';
 dotenv.config();
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const PORT = parseInt(process.env.PORT || '3000');
+const PORT = Number.parseInt(process.env.PORT || '3000');
 
 if (!TOKEN) {
   console.error('❌ TELEGRAM_BOT_TOKEN not set in .env file');
