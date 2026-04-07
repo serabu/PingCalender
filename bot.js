@@ -51,17 +51,23 @@ async function initDatabase() {
     }
 }
 
-// Проверка и отправка напоминаний
+// Проверка и отправка напоминаний (с подробным логированием)
 async function checkReminders() {
+    console.log(`🔍 [${new Date().toISOString()}] Checking reminders...`);
     const client = await pool.connect();
     try {
         const now = Date.now();
+        console.log(`   Current timestamp (ms): ${now}`);
+        
         const result = await client.query(
-            'SELECT id, chat_id, date, time, message FROM reminders WHERE notify_at <= $1',
+            'SELECT id, chat_id, date, time, message, notify_at FROM reminders WHERE notify_at <= $1',
             [now]
         );
         
+        console.log(`   Found ${result.rows.length} reminder(s) to send.`);
+        
         for (const reminder of result.rows) {
+            console.log(`   → Processing reminder ID ${reminder.id}: ${reminder.date} ${reminder.time} (notify_at=${reminder.notify_at})`);
             try {
                 await bot.sendMessage(
                     reminder.chat_id,
@@ -69,38 +75,61 @@ async function checkReminders() {
                     { parse_mode: 'Markdown' }
                 );
                 await client.query('DELETE FROM reminders WHERE id = $1', [reminder.id]);
-                console.log(`✅ Sent reminder ${reminder.id}`);
+                console.log(`   ✅ Sent and deleted reminder ${reminder.id}`);
             } catch (error) {
-                console.error(`Failed to send reminder ${reminder.id}:`, error);
+                console.error(`   ❌ Failed to send reminder ${reminder.id}:`, error.message);
             }
         }
+    } catch (error) {
+        console.error('❌ Error in checkReminders:', error);
     } finally {
         client.release();
     }
 }
 
-// Запуск проверки каждую минуту
-setInterval(checkReminders, 60 * 1000);
+// Запуск проверки каждую минуту (60 000 мс)
+setInterval(() => {
+    checkReminders();
+}, 60 * 1000);
 
 // Команды бота
+
+// /start
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 
         `📅 *PingCalendar Bot - Ваш личный календарь*\n\n` +
         `*Доступные команды:*\n` +
         `/add ДД.ММ.ГГГГ ЧЧ:ММ Текст - Добавить напоминание\n` +
         `/list - Показать все напоминания\n` +
-        `/delete ID - Удалить напоминание\n\n` +
+        `/delete ID - Удалить напоминание\n` +
+        `/time - Показать серверное время (UTC)\n\n` +
         `*Пример:*\n` +
         `/add 31.12.2024 23:59 Запустить салют`,
         { parse_mode: 'Markdown' }
     );
 });
 
+// /time - диагностика времени
+bot.onText(/\/time/, (msg) => {
+    const now = new Date();
+    const nowUtc = new Date(now.toUTCString());
+    bot.sendMessage(msg.chat.id,
+        `🕐 *Серверное время (UTC):*\n` +
+        `${nowUtc.toLocaleString()}\n` +
+        `Timestamp: ${now.getTime()}\n\n` +
+        `📌 *Ваше локальное время* (в телеграме):\n` +
+        `${new Date().toLocaleString()}\n\n` +
+        `⚠️ Напоминания сохраняются в UTC. Если вы в Москве (UTC+3), добавляйте время на 3 часа меньше, например: /add 07.04.2026 16:41 ... (если хотите в 19:41 по Москве)`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+// /add - добавление напоминания (исправлено: UTC)
 bot.onText(/\/add (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const input = match[1];
     
-    const dateRegex = /(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})\s+(.+)/;
+    const dateRegex = /(\d{2}\.\d{2}\\.\d{4})\s+(\d{2}:\d{2})\s+(.+)/;
     const parsed = input.match(dateRegex);
     
     if (!parsed) {
@@ -112,15 +141,26 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     const [day, month, year] = date.split('.');
     const [hours, minutes] = time.split(':');
     
-    const notifyAt = new Date(year, month-1, day, hours, minutes).getTime();
+    // ВАЖНО: Используем UTC для хранения, чтобы сервер правильно сравнивал
+    const notifyAt = Date.UTC(
+        parseInt(year),
+        parseInt(month) - 1,
+        parseInt(day),
+        parseInt(hours),
+        parseInt(minutes),
+        0, 0
+    );
+    
+    const now = Date.now();
+    console.log(`[ADD] Chat ${chatId}: date=${date} time=${time} -> notifyAt=${notifyAt} (UTC), now=${now}, diff=${notifyAt - now}ms`);
     
     if (isNaN(notifyAt)) {
         bot.sendMessage(chatId, '❌ Неверная дата!');
         return;
     }
     
-    if (notifyAt < Date.now()) {
-        bot.sendMessage(chatId, '❌ Дата и время уже прошли!');
+    if (notifyAt < now) {
+        bot.sendMessage(chatId, `❌ Дата и время уже прошли! (Серверное UTC: ${new Date(now).toUTCString()})`);
         return;
     }
     
@@ -130,19 +170,25 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
              VALUES ($1, $2, $3, $4, $5) RETURNING id`,
             [chatId, date, time, message, notifyAt]
         );
-        bot.sendMessage(chatId, `✅ Напоминание добавлено (ID: ${result.rows[0].id})\n📅 ${date} в ${time}\n📝 ${message}`);
+        bot.sendMessage(chatId, 
+            `✅ Напоминание добавлено (ID: ${result.rows[0].id})\n` +
+            `📅 ${date} в ${time}\n` +
+            `📝 ${message}\n` +
+            `🕐 (Сервер сохранил как UTC: ${new Date(notifyAt).toUTCString()})`
+        );
     } catch (error) {
-        console.error(error);
+        console.error('Error saving reminder:', error);
         bot.sendMessage(chatId, '❌ Ошибка при сохранении');
     }
 });
 
+// /list
 bot.onText(/\/list/, async (msg) => {
     const chatId = msg.chat.id;
     
     try {
         const result = await pool.query(
-            `SELECT id, date, time, message 
+            `SELECT id, date, time, message, notify_at
              FROM reminders 
              WHERE chat_id = $1 
              ORDER BY notify_at ASC`,
@@ -154,10 +200,11 @@ bot.onText(/\/list/, async (msg) => {
             return;
         }
         
-        let response = '📋 *Ваши напоминания:*\n\n';
-        result.rows.forEach(row => {
-            response += `*${row.id}.* ${row.date} ${row.time} - ${row.message}\n`;
-        });
+        let response = '📋 *Ваши напоминания (время UTC):*\n\n';
+        for (const row of result.rows) {
+            const reminderDate = new Date(row.notify_at);
+            response += `*${row.id}.* ${row.date} ${row.time} - ${row.message}\n   (UTC: ${reminderDate.toUTCString()})\n`;
+        }
         response += '\nУдалить: `/delete ID`';
         
         bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
@@ -167,6 +214,7 @@ bot.onText(/\/list/, async (msg) => {
     }
 });
 
+// /delete
 bot.onText(/\/delete (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const id = parseInt(match[1]);
@@ -188,12 +236,13 @@ bot.onText(/\/delete (\d+)/, async (msg, match) => {
     }
 });
 
-// Запуск
+// Запуск бота
 async function start() {
     await initDatabase();
     console.log('🤖 Bot is ready!');
     console.log('📅 Calendar bot started');
-    await checkReminders(); // Первая проверка
+    // Первая проверка (сразу после запуска)
+    await checkReminders();
 }
 
 start().catch(console.error);
